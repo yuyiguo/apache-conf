@@ -1,0 +1,553 @@
+#!/bin/sh
+
+##H mkserver [options]
+##H
+##H This script generates apache httpd (v2.2+) configurations for cmsweb
+##H servers. The basic server configuration is a minimal secure server,
+##H which can then be extended with additional configuration modules for
+##H the full server functionality.
+##H
+##H Given a server root and apache2 installation, the installation will be:
+##H   SERVER_ROOT             Server location.
+##H     server.conf           Master server configuration file.
+##H     /var                  Directory for state files.
+##H     /logs                 Directory for server log files.
+##H     /htdocs               Directory for server static content.
+##H     /etc                  Management scripts.
+##H       httpd               Server control script.
+##H       env.d               Server environment setup scripts.
+##H
+##H When server modules are installed, the input files are treated treated
+##H as template files where variables of the form @NAME@ are replaced with
+##H their values. SERVER_ROOT variable is pre-defined to the server root,
+##H the rest of variables get their value from the environment.
+##H
+##H Options:
+##H   -a APACHE2-ROOT         Apache package is installed in APACHE2-ROOT.
+##H   -r SERVER-ROOT          Set server root directory (ServerRoot).
+##H   -n SERVER-NAME          Set server name (ServerName).
+##H   -u USER:GROUP           Run as USER:GROUP (User/Group).
+##H   -l LOGDIR               Produce log files into LOGDIR.
+##H   -p MPM                  Set up with MPM configuration file.
+##H   -e STARTENV             Source STARTENV prior to starting server.
+##H   -m NAME:PATH            Load module NAME from PATH.
+##H   -c CONFIG               Include CONFIG file into server configuration.
+##H   -o OPTION               Start server with OPTION.
+##H   -x FILES[:TO]           Install FILES into 'etc', possibly renamed TO.
+##H   -d DOCS                 Install files from DOCS into htdocs.
+##H   -h                      Display this help.
+
+nl="
+"
+
+# Exit with an error message.
+die() {
+  ex=$1; shift
+  for arg; do echo "$arg" 1>&2; done
+  exit $ex
+}
+
+# Run our substitutions. Run them twice in case included
+# contents also has references to variables (but not more).
+subvars() {
+  local dir=$1; shift
+  local envsub='s{\@([A-Za-z0-9_]+)\@}{$ENV{$1}}ge'
+  local incsub='s{^(\s*)\@INCLUDE ([^\@]+)\@}{
+     local $/; $w = $1; $pat = $2;
+     join "", map { s/^/$w/mg; $_ }
+     map { open(F, "< $_"); ("\n# -- $_\n", <F>) }
+     <'"$dir"'/$pat> }ge'
+
+  perl -p -e "$envsub; $incsub" |
+  perl -p -e "$envsub; $incsub" |
+  perl -p -e "$envsub"
+}
+
+# Grab a documentation hunk from this file.
+hunk() {
+  perl -ne '
+    /^### '"$1"'/ && do { $p++; next };
+    $p && /^###/ && do { $p = 0; last };
+    $p && /^\s*$/ && do { $e .= $_; next };
+    do { print "$e$_"; $e = "" } if $p' < $0
+}
+
+# Process options.
+apache= root= name= user= group= logdir= mpm=
+startenv= modules= configs= options= extra= docs=
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -a ) apache=$2; shift; shift;;
+    -r ) root=$2; shift; shift;;
+    -n ) name=$2; shift; shift;;
+    -u ) user=${2%%:*} group=${2##*:}; shift; shift;;
+    -l ) logdir=$2; shift; shift;;
+    -p ) mpm=$2; shift; shift;;
+    -e ) startenv="${startenv:+$startenv }$2"; shift; shift;;
+    -m ) modules="${modules:+$modules }$2"; shift; shift;;
+    -c ) configs="${configs:+$configs }$2"; shift; shift;;
+    -o ) options="${options:+$options }$2"; shift; shift;;
+    -x ) extra="${extra:+$extra }$2"; shift; shift;;
+    -d ) docs="${docs:+$docs }$2"; shift; shift;;
+    -h ) perl -ne '/^##H/ && do { s/^##H ?//; print }' < $0; exit 0 ;;
+    -* ) die 1 "$0: unrecognised option '$1', try -h for help";;
+    *  ) die 1 "$0: unexpected parameter '$1', try -h for help";;
+  esac
+done
+
+# Validate options.
+[ X"$apache" = X ]     && die 1 "$0: must have apache2 root specified with -i option"
+[ X"$root" = X ]       && die 1 "$0: must have server root specified with -r option"
+
+# Log directory defaults to 'logs' under server root.
+if [ X"$logdir" = X ]; then
+  logdir=$root/logs
+fi
+
+# Server name defaults to host certificate's CN, or if there isn't one,
+# to full host name. If we fail to determine name either way, require it.
+if [ X"$name" = X ]; then
+  name=$(hostname -f)
+  if [ -r /etc/grid-security/hostcert.pem ]; then
+    CN=$(openssl x509 -noout -subject -in /etc/grid-security/hostcert.pem 2>/dev/null | sed 's|.*/CN=||')
+    case $CN in *.*.* ) name=$CN ;; esac
+  fi
+  [ X"$name" = X ] && die 1 "$0: must have server name specified with -n option"
+fi
+
+# Source apache2 server configuration.
+[ -r $apache/etc/profile.d/init.sh ] || die 1 "$apache: no apache2 installation here"
+. $apache/etc/profile.d/init.sh
+[ X"$APACHE2_ROOT" = X ] && die 1 "$apache/etc/profile.d/init.sh did not set \$APACHE2_ROOT"
+
+# Generate new server configuration
+rm -fr $root/etc/env.d $root/htdocs || exit $?
+mkdir -p $logdir $root/{var,htdocs,etc/env.d} || exit $?
+echo "$options" > $root/etc/options.txt
+
+(
+ export APACHE2_ROOT
+ export SERVER_ROOT="$root"
+ export SERVER_NAME="$name"
+ export USER="${user:+User $user}"
+ export GROUP="${group:+Group $group}"
+ export SERVER_NAME="$name"
+ export LOGDIR="$logdir"
+ export MPM="$(hunk DEFMPM)"
+ export MODULES="$(hunk DEFMOD)"
+ export CONFIGS=
+ if [ X"$mpm" != X ]; then
+   MPM=$(cat $mpm)
+ fi
+ for m in $modules; do
+   MODULES="${MODULES}${nl}LoadModule ${m%%:*} ${m##*:}"
+ done
+ for c in $configs; do
+   CONFIGS="${CONFIGS}${nl}$(perl -e "exec 'cat', <$c>" | subvars $(dirname $c))"
+ done
+ hunk CFG | subvars $root > $root/server.conf
+ hunk HTTPD | subvars $root/etc > $root/etc/httpd
+ chmod 755 $root/etc/httpd
+ for f in $extra; do
+   case $f in
+     *:* ) src=${f%%:*} dest=${f##*:} ;;
+     * )   src=$f dest= ;;
+   esac
+   perl -e "exec 'find', <$src>, '-type', 'f'" | while read p; do
+     case $p in
+       *~ | .#* | */CVS/* | */.git/* | */.svn/* )
+         continue ;;
+       * )
+         d=$root/etc/${dest:-$(basename $p)}
+         mkdir -p $(dirname $d)
+         subvars $(dirname $p) < $p > $d
+	 if [ -x $p ]; then
+	   chmod +x $d
+	 else
+	   chmod -x $d
+	 fi ;;
+     esac; done
+ done
+)
+
+for f in $(eval echo $startenv); do
+  cp -p $f $root/etc/env.d/$(basename $f)
+done
+
+for f in $(eval echo $docs); do
+  tar -C $f --exclude CVS --exclude '.#*' --exclude '*~' -cf - . | tar -C $root/htdocs -xf -
+done
+
+exit
+
+######################################################################
+### DEFMOD
+LoadModule authz_host_module @APACHE2_ROOT@/modules/mod_authz_host.so
+LoadModule auth_basic_module @APACHE2_ROOT@/modules/mod_auth_basic.so
+LoadModule ext_filter_module @APACHE2_ROOT@/modules/mod_ext_filter.so
+LoadModule filter_module @APACHE2_ROOT@/modules/mod_filter.so
+LoadModule deflate_module @APACHE2_ROOT@/modules/mod_deflate.so
+LoadModule log_config_module @APACHE2_ROOT@/modules/mod_log_config.so
+LoadModule logio_module @APACHE2_ROOT@/modules/mod_logio.so
+LoadModule env_module @APACHE2_ROOT@/modules/mod_env.so
+LoadModule mime_magic_module @APACHE2_ROOT@/modules/mod_mime_magic.so
+LoadModule expires_module @APACHE2_ROOT@/modules/mod_expires.so
+LoadModule headers_module @APACHE2_ROOT@/modules/mod_headers.so
+LoadModule setenvif_module @APACHE2_ROOT@/modules/mod_setenvif.so
+LoadModule proxy_module @APACHE2_ROOT@/modules/mod_proxy.so
+LoadModule proxy_http_module @APACHE2_ROOT@/modules/mod_proxy_http.so
+LoadModule ssl_module @APACHE2_ROOT@/modules/mod_ssl.so
+LoadModule mime_module @APACHE2_ROOT@/modules/mod_mime.so
+LoadModule asis_module @APACHE2_ROOT@/modules/mod_asis.so
+LoadModule cgi_module @APACHE2_ROOT@/modules/mod_cgi.so
+LoadModule negotiation_module @APACHE2_ROOT@/modules/mod_negotiation.so
+LoadModule dir_module @APACHE2_ROOT@/modules/mod_dir.so
+LoadModule alias_module @APACHE2_ROOT@/modules/mod_alias.so
+LoadModule rewrite_module @APACHE2_ROOT@/modules/mod_rewrite.so
+
+######################################################################
+### DEFMPM
+StartServers            5
+MinSpareServers         5
+MaxSpareServers         10
+MaxClients              150
+MaxRequestsPerChild     100000
+
+######################################################################
+### CFG
+ServerName @SERVER_NAME@
+ServerRoot "@SERVER_ROOT@"
+DocumentRoot "@SERVER_ROOT@/htdocs"
+PidFile @SERVER_ROOT@/var/httpd.pid
+@USER@
+@GROUP@
+
+# Dynamic modules.  Enable explicitly only the bits we need.
+@MODULES@
+
+# Default to disallow everything.
+<Directory />
+  Options FollowSymLinks
+  AllowOverride None
+  Order deny,allow
+  Deny from all
+</Directory>
+
+# Grant basic browsing access to the document root directory.
+<Directory "@SERVER_ROOT@/htdocs">
+  Options FollowSymLinks
+  AllowOverride None
+  Order allow,deny
+  Allow from all
+</Directory>
+
+# Ban access to .ht* files.
+<FilesMatch "^\.ht">
+  Order allow,deny
+  Deny from all
+  Satisfy All
+</FilesMatch>
+
+# Logging defaults.
+LogLevel warn
+ErrorLog "||@APACHE2_ROOT@/bin/rotatelogs -f @LOGDIR@/error_log_%Y%m%d.txt 86400"
+CustomLog "||@APACHE2_ROOT@/bin/rotatelogs -f @LOGDIR@/access_log_%Y%m%d.txt 86400" \
+  "%t %v %a \"%r\" %>s [data: %I in %O out %b body %D us ] [auth: %{SSL_PROTOCOL}x %{SSL_CIPHER}x \"%{SSL_CLIENT_S_DN}x\" \"%{cms-auth}C\" ] [ref: \"%{Referer}i\" \"%{User-Agent}i\" ]"
+  #RewriteLogLevel 3
+  #RewriteLog @LOGDIR@/rewrite_log
+
+# Content and default index definitions.
+DirectoryIndex index.html
+DefaultType text/plain
+TypesConfig @APACHE2_ROOT@/conf/mime.types
+AddType application/x-compress .Z
+AddType application/x-gzip .gz .tgz
+
+# Basic SSL settings.  The rest are in virtual host definitions.
+SSLRandomSeed startup builtin
+SSLRandomSeed connect builtin
+SSLMutex file:@SERVER_ROOT@/var/ssl_mutex
+SSLSessionCache shmcb:@SERVER_ROOT@/var/ssl_scache(512000) 
+SSLSessionCacheTimeout 300
+
+# Server capacity settings.
+@MPM@
+
+# Various basic configurables.
+Timeout			300
+KeepAlive		On
+MaxKeepAliveRequests	100
+KeepAliveTimeout	5
+UseCanonicalName	Off
+ServerTokens		Prod
+ServerSignature		Off
+HostnameLookups		Off
+TraceEnable		Off
+
+# Now include actual server application containers.
+@CONFIGS@
+
+######################################################################
+### HTTPD
+#!/bin/bash
+# chkconfig: - 85 15
+# description: CMS custom web server.
+# processname: httpd
+# config: @SERVER_ROOT@/server.conf
+# pidfile: @SERVER_ROOT@/var/httpd.pid
+
+# Source function library.
+. /etc/rc.d/init.d/functions
+
+# Source run time environment.
+for file in @SERVER_ROOT@/etc/env.d/*.sh; do
+  [ -f $file ] || continue
+  . $file
+done
+
+# Set OPENSSL_ALLOW_PROXY_CERTS to accept RFC3820 proxy certificates.
+# One day this might be sufficient for mod_ssl to accept proxies. For
+# now we use VDT's mod_ssl GSI patch instead and leave this variable
+# disabled because because "old" grid proxies (myproxy, voms) aren't
+# conforming to RFC3820, and also the variable appears to make no
+# difference - possibly because mod_ssl cert verify is being reached
+# via an internal subrequest renaming environment variables, and/or
+# because mod_ssl needs a certificate validation callback to verify
+# critical extensions in addition to this flag. More info at:
+#
+# http://www.openssl.org/docs/HOWTO/proxy_certificates.txt
+# http://security.ncsa.illinois.edu/research/wssec/gsihttps/gsiapache.html
+# http://vdt.cs.wisc.edu/internal/apache-wisdom.html
+# http://www.nikhef.nl/~janjust/proxy-verify/
+#
+# export OPENSSL_ALLOW_PROXY_CERTS=1
+
+# Set server options.
+OPTIONS="-f @SERVER_ROOT@/server.conf $(cat @SERVER_ROOT@/etc/options.txt)"
+
+# Path to the server binary, and short-form for messages.
+prog=httpd
+httpd=@APACHE2_ROOT@/bin/httpd
+pidfile=@SERVER_ROOT@/var/httpd.pid
+lockfile=@SERVER_ROOT@/var/httpd.lock
+logfile=@LOGDIR@/start_stop.log
+RETVAL=0
+savedpid=""
+
+# A safer approach to get the pid of httpd.  It only seaches for pids
+# based on the full path of an executable file, and returns the parent
+# process. Argument: the full path of the httpd binary
+getpidfromexec() {
+	if [ "$#" -eq 0 ]; then
+	    echo $"Usage: getpidfromexec {program}"
+	    savedpid=''
+	    return 1
+	fi
+        local awkprog="/${1//\//\\/}/ && !/awk/ {printf (\"%d\\n\",\$2)}"
+        savedpid=`ps hauxww --sort ppid | awk "$awkprog" | head -n1`
+	return 0
+}
+
+# Rewriten killproc() from /etc/rc.d/init.d/functions because it was
+# killing other httpd processes when the server had already been stopped
+killproc() {
+        RC=0; delay=3
+        # Test syntax.
+        if [ "$#" -eq 0 ]; then
+                echo $"Usage: killproc [ -d delay] {program} [signal]"
+                return 1
+        fi
+        if [ "$1" = "-d" ]; then
+                delay=$2
+                shift 2
+        fi
+
+        notset=0
+        # check for second arg to be kill level
+        if [ -n "$2" ]; then
+                killlevel=$2
+        else
+                notset=1
+                killlevel="-9"
+        fi
+
+        # Save basename.
+        base=${1##*/}
+
+        # Find pid.
+        pid=
+        if [ -f $pidfile ]; then
+                local line p
+                read line < $pidfile
+                for p in $line ; do
+                        [ -z "${p//[0-9]/}" -a -d "/proc/$p" ] && pid="$pid $p"
+                done
+        fi
+        # remove the space at the beginning of pid
+        pid=${pid#" "}
+        if [ -z "$pid" ]; then
+                getpidfromexec $1
+                pid=$savedpid
+        fi
+
+        # Kill it.
+        if [ -n "${pid:-}" ] ; then
+                [ "$BOOTUP" = "verbose" -a -z "$LSB" ] && echo -n "$base "
+                if [ "$notset" -eq "1" ] ; then
+                       if checkpid $pid 2>&1; then
+                           # TERM first, then KILL if not dead
+                           kill -TERM $pid >/dev/null 2>&1
+                           usleep 100000
+                           if checkpid $pid && sleep 1 &&
+                              checkpid $pid && sleep $delay &&
+                              checkpid $pid ; then
+                                kill -KILL $pid >/dev/null 2>&1
+                                usleep 100000
+                           fi
+                        fi
+                        checkpid $pid
+                        RC=$?
+                        [ "$RC" -eq 0 ] && failure $"$base shutdown" || success $"$base shutdown"
+                        RC=$((! $RC))
+                # use specified level only
+                else
+                        if checkpid $pid; then
+                                kill $killlevel $pid >/dev/null 2>&1
+                                RC=$?
+                                [ "$RC" -eq 0 ] && success $"$base $killlevel" || failure $"$base $killlevel"
+                        fi
+                fi
+        else
+            failure $"$base shutdown"
+            RC=1
+        fi
+
+        # Remove pid file if any.
+        if [ "$notset" = "1" ]; then
+            rm -f $pidfile
+        fi
+	savedpid=$pid
+        return $RC
+}
+
+# The semantics of these two functions differ from the way apachectl does
+# things -- attempting to start while running is a failure, and shutdown
+# when not running is also a failure.  So we just do it the way init scripts
+# are expected to behave here.
+start() {
+  echo -n $"Starting $prog: "
+  LANG=C daemon $httpd $OPTIONS
+  RETVAL=$?
+  echo
+  if [ $RETVAL = 0 ]; then
+    touch ${lockfile}
+    sleep 1 # give apache some time to fire up...
+    getpidfromexec $httpd
+    echo "$(date +'[%d/%b/%Y %H:%M:%S %z]') httpd started pid=$savedpid" >> $logfile
+  fi
+  return $RETVAL
+}
+stop() {
+  echo -n $"Stopping $prog: "
+  killproc $httpd
+  RETVAL=$?
+  echo
+  if [ $RETVAL = 0 ]; then
+    rm -f ${lockfile} ${pidfile}
+    echo "$(date +'[%d/%b/%Y %H:%M:%S %z]') httpd stopped pid=$savedpid" >> $logfile
+  fi
+}
+reload() {
+  echo -n $"Reloading $prog: "
+  if ! LANG=C $httpd $OPTIONS -t >&/dev/null; then
+    RETVAL=$?
+    echo $"not reloading due to configuration syntax error"
+    failure $"not reloading $httpd due to configuration syntax error"
+  else
+    killproc $httpd -HUP
+    RETVAL=$?
+    [ $RETVAL = 0 ] && echo "$(date +'[%d/%b/%Y %H:%M:%S %z]') httpd reloaded pid=$savedpid" >> $logfile
+  fi
+  echo
+}
+status() {
+  local base=${1##*/}
+  local pid
+
+  getpidfromexec $1
+  pid=$savedpid
+  if [ -n "$pid" ]; then
+    echo $"${base} (pid $pid) is running..."
+    return 0
+  fi
+
+  # Next try "*.pid" files
+  if [ -f $pidfile ] ; then
+    read pid < $pidfile
+    if [ -n "$pid" ]; then
+      echo $"${base} dead but pid file exists"
+      return 1
+    fi
+  fi
+
+  # See if $lockfile exists
+  if [ -f $lockfile ]; then
+    echo $"${base} dead but subsys locked"
+    return 2
+  fi
+  echo $"${base} is stopped"
+  return 3
+}
+
+  
+# See how we were called.
+case "$1" in
+  start)
+    start
+    ;;
+  stop)
+    stop
+    ;;
+  status)
+    status $httpd
+    RETVAL=$?
+    ;;
+  restart)
+    stop
+    start
+    ;;
+  condrestart)
+    if [ -f ${pidfile} ] ; then
+      stop
+      start
+    fi
+    ;;
+  reload)
+    reload
+    ;;
+  graceful)
+    LANG=C $httpd $OPTIONS -k $@
+    RETVAL=$?
+    if [ $RETVAL = 0 ]; then
+      getpidfromexec $httpd
+      echo "$(date +'[%d/%b/%Y %H:%M:%S %z]') httpd graceful restart pid=$savedpid" >> $logfile
+    fi
+    ;;
+  configtest)
+    LANG=C $httpd $OPTIONS -t
+    RETVAL=$?
+    ;;
+  help)
+    LANG=C $httpd $OPTIONS $@
+    RETVAL=$?
+    ;;
+  fullstatus)
+    ${LYNX-"lynx -dump"} ${STATUSURL-"http://localhost:80/server-status"}
+    ;;
+  *)
+    echo $"Usage: $prog {start|stop|restart|condrestart|reload|status|fullstatus|graceful|help|configtest}"
+    exit 1
+esac
+
+exit $RETVAL
