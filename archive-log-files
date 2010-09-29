@@ -13,8 +13,8 @@ archdir=$1; shift
 find $logdir -name '*_log_*' -mtime +0 -print |
   while read f; do
     case $f in *.zip ) continue ;; esac
-    kind=$(echo $f | sed 's/_[0-9]*$//')
-    month=$(echo $f | sed 's/.*_log_//; s/..$//')
+    kind=$(echo $f | sed 's/_[0-9]*\(.txt\)*$//')
+    month=$(echo $f | sed 's/.*_log_//; s/..\(\.txt\)*$//')
     zip -9Trmuoqj ${kind}_${month}.zip $f ||
       { echo "$f: failed to archive logs: $?" 1>&2; exit 3; }
   done
@@ -23,15 +23,15 @@ find $logdir -name '*_log_*' -mtime +0 -print |
 find $logdir -name '*_log_*' -print |
   while read f; do
     case $f in *.zip ) continue ;; esac
-    kind=$(echo $f | sed 's/_[0-9]*$//')
-    month=$(echo $f | sed 's/.*_log_//; s/..$//')
+    kind=$(echo $f | sed 's/_[0-9]*\(.txt\)*$//')
+    month=$(echo $f | sed 's/.*_log_//; s/..\(\.txt\)*$//')
     zip -9Truoqj ${kind}_${month}.zip $f ||
       { echo "$f: failed to archive logs: $?" 1>&2; exit 4; }
   done
 
 # Archive logs to secure area.
 rsync --delete --delete-excluded --exclude '*.txt' \
-  -auz -e 'ssh -c blowfish' $logdir/ $archdir/ ||
+  -auz --no-group -e 'ssh -c blowfish' $logdir/ $archdir/ ||
   { echo "failed to synchronise logs to $archdir: $?" 1>&2; exit 5; }
 
 exit 0
