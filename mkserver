@@ -183,6 +183,10 @@ exit
 
 ######################################################################
 ### DEFMOD
+LoadModule socache_shmcb_module @APACHE2_ROOT@/modules/mod_socache_shmcb.so
+LoadModule access_compat_module @APACHE2_ROOT@/modules/mod_access_compat.so
+LoadModule unixd_module @APACHE2_ROOT@/modules/mod_unixd.so
+LoadModule authz_core_module @APACHE2_ROOT@/modules/mod_authz_core.so
 LoadModule authz_host_module @APACHE2_ROOT@/modules/mod_authz_host.so
 LoadModule auth_basic_module @APACHE2_ROOT@/modules/mod_auth_basic.so
 LoadModule ext_filter_module @APACHE2_ROOT@/modules/mod_ext_filter.so
@@ -212,8 +216,8 @@ StartServers            5
 MinSpareServers         5
 MaxSpareServers         10
 ServerLimit             350
-MaxClients              300
-MaxRequestsPerChild     100000
+MaxRequestWorkers       300
+MaxConnectionsPerChild  100000
 
 ######################################################################
 ### CFG
@@ -255,12 +259,9 @@ LogLevel warn
 ErrorLog "||@APACHE2_ROOT@/bin/rotatelogs -f @LOGDIR@/error_log_%Y%m%d.txt 86400"
 CustomLog "||@APACHE2_ROOT@/bin/rotatelogs -f @LOGDIR@/access_log_%Y%m%d.txt 86400" \
   "%t %v %a \"%r\" %>s [data: %I in %O out %b body %D us ] [auth: %{SSL_PROTOCOL}x %{SSL_CIPHER}x \"%{SSL_CLIENT_S_DN}x\" \"%{cms-auth}C\" ] [ref: \"%{Referer}i\" \"%{User-Agent}i\" ]"
-  #RewriteLogLevel 3
-  #RewriteLog @LOGDIR@/rewrite_log
 
 # Content and default index definitions.
 DirectoryIndex index.html
-DefaultType text/plain
 TypesConfig @APACHE2_ROOT@/conf/mime.types
 AddType application/x-compress .Z
 AddType application/x-gzip .gz .tgz
@@ -268,7 +269,7 @@ AddType application/x-gzip .gz .tgz
 # Basic SSL settings.  The rest are in virtual host definitions.
 SSLRandomSeed startup builtin
 SSLRandomSeed connect builtin
-SSLMutex file:@SERVER_ROOT@/var/ssl_mutex
+Mutex file:@SERVER_ROOT@/var ssl-cache
 SSLSessionCache shmcb:@SERVER_ROOT@/var/ssl_scache(512000) 
 SSLSessionCacheTimeout 300
 
