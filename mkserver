@@ -209,6 +209,7 @@ LoadModule negotiation_module @APACHE2_ROOT@/modules/mod_negotiation.so
 LoadModule dir_module @APACHE2_ROOT@/modules/mod_dir.so
 LoadModule alias_module @APACHE2_ROOT@/modules/mod_alias.so
 LoadModule rewrite_module @APACHE2_ROOT@/modules/mod_rewrite.so
+LoadModule status_module @APACHE2_ROOT@/modules/mod_status.so
 
 ######################################################################
 ### DEFMPM
